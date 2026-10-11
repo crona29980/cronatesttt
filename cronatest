@@ -1,0 +1,1173 @@
+-- LocalScript: StarterPlayer > StarterPlayerScripts
+-- Animated native UI (purple by default) with a theme picker and credits,
+-- plus the ESP (boxes, tracers, skeleton, health bars, names, distance, chams)
+-- and aim assist. Works WITHOUT Roblox Humanoids (see the CFG block below).
+-- RightShift shows/hides the window.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+
+local localPlayer = Players.LocalPlayer
+local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+-- Optional: restrict the tool to specific users, e.g. { [123456789] = true }.
+-- Leave as nil to let everyone use it.
+local ALLOWED = nil
+if ALLOWED and not ALLOWED[localPlayer.UserId] then return end
+
+---------------------------------------------------------------------
+-- Game adapter: EDIT THIS to match how your game stores character data
+---------------------------------------------------------------------
+local CFG = {
+	HealthName = "Health",       -- attribute or NumberValue on the character
+	MaxHealthName = "MaxHealth", -- same, optional (falls back to 100)
+	RootName = nil,              -- main part name; nil = use the model's PrimaryPart
+	HeadName = "Head",           -- part used when Aim target = Head
+	TorsoName = nil,             -- part used when Aim target = Torso; nil = root part
+}
+
+-- Skeleton bones: pairs of part names inside YOUR character model.
+-- Leave empty to skip the skeleton. Example:
+-- { "Head", "Torso" }, { "Torso", "LeftArm" }, { "Torso", "RightArm" },
+local CUSTOM_BONES = {
+}
+
+local function readNumber(character, name)
+	local v = character:GetAttribute(name)
+	if type(v) == "number" then return v end
+	local obj = character:FindFirstChild(name, true)
+	if obj and obj:IsA("ValueBase") and type(obj.Value) == "number" then return obj.Value end
+	return nil
+end
+
+-- Returns { character, root, health, maxHealth } or nil if the player has no usable character.
+local function getInfo(player)
+	local character = player.Character
+	if not character or not character:IsA("Model") then return nil end
+	local root = (CFG.RootName and character:FindFirstChild(CFG.RootName, true))
+		or character.PrimaryPart
+		or character:FindFirstChildWhichIsA("BasePart", true)
+	if not root then return nil end
+	local health = readNumber(character, CFG.HealthName) or 100 -- no health data = treat as alive
+	local maxHealth = readNumber(character, CFG.MaxHealthName) or math.max(health, 100)
+	return { character = character, root = root, health = health, maxHealth = maxHealth }
+end
+
+---------------------------------------------------------------------
+-- Themes
+---------------------------------------------------------------------
+local ThemeOrder = { "Purple", "Deep Violet", "Neon Purple", "Midnight", "Crimson", "Emerald" }
+
+local Themes = {
+	["Purple"] = {
+		Background = Color3.fromRGB(20, 14, 32), Sidebar = Color3.fromRGB(28, 20, 44),
+		Element = Color3.fromRGB(40, 29, 62), Accent = Color3.fromRGB(150, 90, 255),
+		Accent2 = Color3.fromRGB(205, 120, 255), Text = Color3.fromRGB(242, 236, 255),
+		SubText = Color3.fromRGB(165, 150, 195),
+	},
+	["Deep Violet"] = {
+		Background = Color3.fromRGB(12, 8, 22), Sidebar = Color3.fromRGB(18, 12, 34),
+		Element = Color3.fromRGB(28, 20, 52), Accent = Color3.fromRGB(120, 70, 235),
+		Accent2 = Color3.fromRGB(170, 100, 255), Text = Color3.fromRGB(238, 232, 255),
+		SubText = Color3.fromRGB(150, 135, 190),
+	},
+	["Neon Purple"] = {
+		Background = Color3.fromRGB(18, 10, 28), Sidebar = Color3.fromRGB(26, 14, 40),
+		Element = Color3.fromRGB(40, 20, 60), Accent = Color3.fromRGB(190, 60, 255),
+		Accent2 = Color3.fromRGB(255, 80, 200), Text = Color3.fromRGB(250, 235, 255),
+		SubText = Color3.fromRGB(175, 140, 195),
+	},
+	["Midnight"] = {
+		Background = Color3.fromRGB(18, 18, 26), Sidebar = Color3.fromRGB(24, 24, 34),
+		Element = Color3.fromRGB(34, 34, 48), Accent = Color3.fromRGB(110, 120, 255),
+		Accent2 = Color3.fromRGB(80, 190, 255), Text = Color3.fromRGB(235, 235, 245),
+		SubText = Color3.fromRGB(150, 150, 170),
+	},
+	["Crimson"] = {
+		Background = Color3.fromRGB(22, 16, 18), Sidebar = Color3.fromRGB(30, 20, 24),
+		Element = Color3.fromRGB(42, 28, 33), Accent = Color3.fromRGB(235, 70, 90),
+		Accent2 = Color3.fromRGB(255, 150, 90), Text = Color3.fromRGB(245, 235, 238),
+		SubText = Color3.fromRGB(170, 145, 150),
+	},
+	["Emerald"] = {
+		Background = Color3.fromRGB(12, 22, 18), Sidebar = Color3.fromRGB(16, 30, 24),
+		Element = Color3.fromRGB(24, 44, 35), Accent = Color3.fromRGB(60, 220, 140),
+		Accent2 = Color3.fromRGB(90, 255, 205), Text = Color3.fromRGB(232, 250, 242),
+		SubText = Color3.fromRGB(140, 175, 160),
+	},
+}
+
+-- Animated background style per theme (all themes also get a soft gradient wash)
+local BackgroundStyles = {
+	["Purple"] = "orbs",
+	["Deep Violet"] = "stars",
+	["Neon Purple"] = "streaks",
+	["Midnight"] = "stars",
+	["Crimson"] = "embers",
+	["Emerald"] = "rain",
+}
+local BackgroundCounts = { orbs = 10, stars = 28, streaks = 7, embers = 18, rain = 16 }
+
+---------------------------------------------------------------------
+-- Mini UI library
+---------------------------------------------------------------------
+local function corner(parent, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius or 6)
+	c.Parent = parent
+	return c
+end
+
+local function tween(obj, props, time, style)
+	TweenService:Create(obj,
+		TweenInfo.new(time or 0.15, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		props):Play()
+end
+
+local function gradSeq(t)
+	return ColorSequence.new({
+		ColorSequenceKeypoint.new(0, t.Accent),
+		ColorSequenceKeypoint.new(0.5, t.Accent2),
+		ColorSequenceKeypoint.new(1, t.Accent),
+	})
+end
+
+local UI = {}
+
+function UI:CreateWindow(opts)
+	local themeName = Themes[opts.Theme] and opts.Theme or "Purple"
+	local theme = Themes[themeName]
+	local window = { Flags = { Theme = themeName }, Setters = {}, Tabs = {}, ThemeName = themeName, Open = true }
+	local bindings, gradients = {}, {}
+
+	local saving = opts.ConfigurationSaving
+	local configKey = "UIConfig_" .. ((saving and saving.FolderName) or opts.Name or "Hub")
+	local autoSave = saving and saving.Enabled
+
+	-- bind(obj, prop, "Key" | function(theme) -> value): themed property that
+	-- re-tweens whenever the theme changes.
+	local function bind(obj, prop, fn)
+		if type(fn) == "string" then
+			local key = fn
+			fn = function(t) return t[key] end
+		end
+		obj[prop] = fn(theme)
+		table.insert(bindings, { obj = obj, prop = prop, fn = fn })
+	end
+
+	local function addGradient(parent)
+		local g = Instance.new("UIGradient")
+		g.Color = gradSeq(theme)
+		g.Parent = parent
+		table.insert(gradients, g)
+		return g
+	end
+
+	local function makeLabel(parent, text, align, colorKey)
+		local l = Instance.new("TextLabel")
+		l.BackgroundTransparency = 1
+		l.Text = text
+		l.Font = Enum.Font.Gotham
+		l.TextSize = 13
+		l.TextXAlignment = align or Enum.TextXAlignment.Left
+		bind(l, "TextColor3", colorKey or "Text")
+		l.Parent = parent
+		return l
+	end
+
+	---------------------------------------------------------------- frame
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "NativeHub"
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 10
+	gui.Parent = playerGui
+
+	local main = Instance.new("CanvasGroup")
+	main.Size = UDim2.fromOffset(540, 380)
+	main.Position = UDim2.new(0.5, -270, 0.5, -190)
+	main.BorderSizePixel = 0
+	main.GroupTransparency = 1
+	bind(main, "BackgroundColor3", "Background")
+	main.Parent = gui
+	corner(main, 10)
+
+	local scale = Instance.new("UIScale")
+	scale.Scale = 0.9
+	scale.Parent = main
+
+	---------------------------------------------------------------- animated background
+	local bgLayer = Instance.new("Frame")
+	bgLayer.Name = "Background"
+	bgLayer.Size = UDim2.fromScale(1, 1)
+	bgLayer.BackgroundTransparency = 1
+	bgLayer.ClipsDescendants = true
+	bgLayer.ZIndex = 0
+	bgLayer.Parent = main
+
+	-- Soft rotating gradient wash (follows the theme colors)
+	local wash = Instance.new("Frame")
+	wash.Size = UDim2.fromScale(1, 1)
+	wash.BackgroundColor3 = Color3.new(1, 1, 1)
+	wash.BackgroundTransparency = 0.88
+	wash.BorderSizePixel = 0
+	wash.ZIndex = 0
+	wash.Parent = bgLayer
+	local washGrad = addGradient(wash)
+	TweenService:Create(washGrad,
+		TweenInfo.new(14, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1),
+		{ Rotation = 360 }):Play()
+
+	local particles, bgToken = {}, 0
+
+	local function rand(a, b)
+		return a + math.random() * (b - a)
+	end
+
+	local function clearBackground()
+		bgToken += 1
+		for _, p in ipairs(particles) do p:Destroy() end
+		table.clear(particles)
+	end
+
+	local function spawnParticle(kind, token)
+		if token ~= bgToken then return end
+
+		local f = Instance.new("Frame")
+		f.BorderSizePixel = 0
+		f.AnchorPoint = Vector2.new(0.5, 0.5)
+		f.BackgroundColor3 = math.random() < 0.5 and theme.Accent or theme.Accent2
+		f.BackgroundTransparency = 1
+		f.ZIndex = 0
+
+		local startPos, goalPos, dur, peak
+		if kind == "orbs" then -- soft glowing circles drifting up
+			local s = rand(14, 34)
+			f.Size = UDim2.fromOffset(s, s)
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0.5, 0)
+			c.Parent = f
+			local x = rand(0.05, 0.95)
+			startPos = UDim2.fromScale(x, 1.1)
+			goalPos = UDim2.fromScale(x + rand(-0.12, 0.12), -0.1)
+			dur, peak = rand(8, 14), 0.8
+		elseif kind == "stars" then -- twinkling dots with a tiny drift
+			local s = rand(2, 3.5)
+			f.Size = UDim2.fromOffset(s, s)
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0.5, 0)
+			c.Parent = f
+			local x, y = rand(0.03, 0.97), rand(0.03, 0.97)
+			startPos = UDim2.fromScale(x, y)
+			goalPos = UDim2.fromScale(x + rand(-0.02, 0.02), y + rand(-0.02, 0.02))
+			dur, peak = rand(1.6, 3.6), 0.25
+		elseif kind == "embers" then -- small sparks rising and swaying
+			local s = rand(3, 5)
+			f.Size = UDim2.fromOffset(s, s)
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0.5, 0)
+			c.Parent = f
+			local x = rand(0.05, 0.95)
+			startPos = UDim2.fromScale(x, 1.05)
+			goalPos = UDim2.fromScale(x + rand(-0.15, 0.15), rand(0.1, 0.5))
+			dur, peak = rand(3, 6), 0.3
+		elseif kind == "rain" then -- thin falling lines
+			f.Size = UDim2.fromOffset(2, rand(10, 22))
+			local x = rand(0.03, 0.97)
+			startPos = UDim2.fromScale(x, -0.1)
+			goalPos = UDim2.fromScale(x, 1.1)
+			dur, peak = rand(2.5, 5), 0.65
+		else -- "streaks": glowing lines sweeping diagonally
+			f.Size = UDim2.fromOffset(rand(60, 120), 2)
+			f.Rotation = -15
+			local y = rand(0.4, 1.2)
+			startPos = UDim2.fromScale(-0.2, y)
+			goalPos = UDim2.fromScale(1.2, y - 0.5)
+			dur, peak = rand(3, 5.5), 0.6
+		end
+
+		f.Position = startPos
+		f.Parent = bgLayer
+		table.insert(particles, f)
+
+		local move = TweenService:Create(f,
+			TweenInfo.new(dur, Enum.EasingStyle.Linear), { Position = goalPos })
+		local fade = TweenService:Create(f,
+			TweenInfo.new(dur / 2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 0, true),
+			{ BackgroundTransparency = peak })
+
+		move.Completed:Connect(function()
+			local i = table.find(particles, f)
+			if i then table.remove(particles, i) end
+			f:Destroy()
+			spawnParticle(kind, token) -- respawn (no-op if the theme changed meanwhile)
+		end)
+		move:Play()
+		fade:Play()
+	end
+
+	local function buildBackground()
+		clearBackground()
+		if not bgLayer.Visible then return end
+		local kind = BackgroundStyles[window.ThemeName] or "orbs"
+		local token = bgToken
+		for _ = 1, BackgroundCounts[kind] or 12 do
+			task.delay(math.random() * 3, spawnParticle, kind, token)
+		end
+	end
+
+	function window:SetBackground(on)
+		bgLayer.Visible = on
+		buildBackground()
+	end
+
+	buildBackground()
+
+	-- Animated gradient border
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 2
+	stroke.Color = Color3.new(1, 1, 1)
+	stroke.Parent = main
+	local strokeGrad = addGradient(stroke)
+	TweenService:Create(strokeGrad,
+		TweenInfo.new(5, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1),
+		{ Rotation = 360 }):Play()
+
+	-- Title + animated accent bar
+	local title = makeLabel(main, opts.Name or "Hub", Enum.TextXAlignment.Left)
+	title.Size = UDim2.new(1, 0, 0, 34)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 15
+	local titlePad = Instance.new("UIPadding")
+	titlePad.PaddingLeft = UDim.new(0, 14)
+	titlePad.Parent = title
+
+	local bar = Instance.new("Frame")
+	bar.Position = UDim2.fromOffset(14, 34)
+	bar.Size = UDim2.new(1, -28, 0, 2)
+	bar.BackgroundColor3 = Color3.new(1, 1, 1)
+	bar.BorderSizePixel = 0
+	bar.Parent = main
+	corner(bar, 1)
+	local barGrad = addGradient(bar)
+	barGrad.Offset = Vector2.new(-1, 0)
+	TweenService:Create(barGrad,
+		TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+		{ Offset = Vector2.new(1, 0) }):Play()
+
+	local sidebar = Instance.new("Frame")
+	sidebar.Position = UDim2.fromOffset(8, 44)
+	sidebar.Size = UDim2.new(0, 118, 1, -52)
+	sidebar.BorderSizePixel = 0
+	bind(sidebar, "BackgroundColor3", "Sidebar")
+	sidebar.BackgroundTransparency = 0.2
+	sidebar.Parent = main
+	corner(sidebar, 8)
+	local sideLayout = Instance.new("UIListLayout")
+	sideLayout.Padding = UDim.new(0, 4)
+	sideLayout.Parent = sidebar
+	local sidePad = Instance.new("UIPadding")
+	sidePad.PaddingTop, sidePad.PaddingLeft, sidePad.PaddingRight =
+		UDim.new(0, 6), UDim.new(0, 6), UDim.new(0, 6)
+	sidePad.Parent = sidebar
+
+	local content = Instance.new("Frame")
+	content.Position = UDim2.fromOffset(134, 44)
+	content.Size = UDim2.new(1, -142, 1, -52)
+	content.BackgroundTransparency = 1
+	content.ClipsDescendants = true
+	content.Parent = main
+
+	---------------------------------------------------------------- open / close animation
+	function window:SetVisible(v)
+		window.Open = v
+		if v then
+			main.Visible = true
+			tween(scale, { Scale = 1 }, 0.35, Enum.EasingStyle.Back)
+			tween(main, { GroupTransparency = 0 }, 0.25)
+		else
+			tween(scale, { Scale = 0.92 }, 0.2)
+			tween(main, { GroupTransparency = 1 }, 0.2)
+			task.delay(0.22, function()
+				if not window.Open then main.Visible = false end
+			end)
+		end
+	end
+	window:SetVisible(true)
+
+	---------------------------------------------------------------- input
+	local dragging, dragStart, startPos
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, main.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if not processed and input.KeyCode == (opts.ToggleKey or Enum.KeyCode.RightShift) then
+			window:SetVisible(not window.Open)
+		end
+	end)
+
+	---------------------------------------------------------------- config (session-only)
+	local function commit(flag, value, silent, callback)
+		window.Flags[flag] = value
+		if silent then return end
+		if callback then task.spawn(callback, value) end
+		if autoSave and not window._loading then window:SaveConfig() end
+	end
+
+	function window:SaveConfig()
+		localPlayer:SetAttribute(configKey, HttpService:JSONEncode(self.Flags))
+	end
+
+	function window:LoadConfig()
+		local raw = localPlayer:GetAttribute(configKey)
+		if type(raw) ~= "string" then return false end
+		local ok, data = pcall(HttpService.JSONDecode, HttpService, raw)
+		if not ok or type(data) ~= "table" then return false end
+		self._loading = true
+		for flag, value in pairs(data) do
+			local setter = self.Setters[flag]
+			if setter then setter(value, false) end
+		end
+		self._loading = false
+		return true
+	end
+
+	---------------------------------------------------------------- themes
+	function window:SetTheme(name, silent)
+		local t = Themes[name]
+		if not t then return end
+		theme = t
+		window.ThemeName = name
+		for _, b in ipairs(bindings) do
+			tween(b.obj, { [b.prop] = b.fn(t) }, 0.4)
+		end
+		for _, g in ipairs(gradients) do
+			g.Color = gradSeq(t)
+		end
+		buildBackground()
+		commit("Theme", name, silent)
+	end
+	window.Setters.Theme = function(v, silent) window:SetTheme(v, silent) end
+
+	---------------------------------------------------------------- tabs
+	local function refreshTabs(slide)
+		for _, t in ipairs(window.Tabs) do
+			local sel = window.Selected == t
+			tween(t.Button, {
+				BackgroundColor3 = sel and theme.Element or theme.Sidebar,
+				TextColor3 = sel and theme.Text or theme.SubText,
+			})
+			tween(t.Stripe, { Size = UDim2.fromOffset(3, sel and 16 or 0) }, 0.25, Enum.EasingStyle.Back)
+			t.Page.Visible = sel
+			if sel and slide then
+				t.Page.Position = UDim2.fromOffset(0, 16)
+				tween(t.Page, { Position = UDim2.fromOffset(0, 0) }, 0.28, Enum.EasingStyle.Quint)
+			end
+		end
+	end
+
+	function window:CreateTab(o)
+		local tab = {}
+
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.new(1, 0, 0, 30)
+		button.BorderSizePixel = 0
+		button.Text = o.Name
+		button.Font = Enum.Font.Gotham
+		button.TextSize = 13
+		button.AutoButtonColor = false
+		bind(button, "BackgroundColor3", function(t) return window.Selected == tab and t.Element or t.Sidebar end)
+		bind(button, "TextColor3", function(t) return window.Selected == tab and t.Text or t.SubText end)
+		button.BackgroundTransparency = 0.2
+		button.Parent = sidebar
+		corner(button, 6)
+
+		local stripe = Instance.new("Frame")
+		stripe.AnchorPoint = Vector2.new(0, 0.5)
+		stripe.Position = UDim2.new(0, 3, 0.5, 0)
+		stripe.Size = UDim2.fromOffset(3, 0)
+		stripe.BorderSizePixel = 0
+		bind(stripe, "BackgroundColor3", "Accent")
+		stripe.Parent = button
+		corner(stripe, 2)
+
+		local page = Instance.new("ScrollingFrame")
+		page.Size = UDim2.fromScale(1, 1)
+		page.BackgroundTransparency = 1
+		page.BorderSizePixel = 0
+		page.ScrollBarThickness = 3
+		page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		page.CanvasSize = UDim2.new()
+		page.Visible = false
+		page.Parent = content
+		local layout = Instance.new("UIListLayout")
+		layout.Padding = UDim.new(0, 6)
+		layout.Parent = page
+		local pad = Instance.new("UIPadding")
+		pad.PaddingRight = UDim.new(0, 8)
+		pad.Parent = page
+
+		tab.Page, tab.Button, tab.Stripe = page, button, stripe
+		table.insert(window.Tabs, tab)
+
+		button.MouseButton1Click:Connect(function()
+			if window.Selected == tab then return end
+			window.Selected = tab
+			refreshTabs(true)
+		end)
+		if #window.Tabs == 1 then
+			window.Selected = tab
+			refreshTabs(true)
+		end
+
+		local function makeRow(height, noHover)
+			local row = Instance.new("TextButton")
+			row.Size = UDim2.new(1, 0, 0, height)
+			row.BorderSizePixel = 0
+			row.Text = ""
+			row.AutoButtonColor = false
+			bind(row, "BackgroundColor3", "Element")
+			row.BackgroundTransparency = 0.15
+			row.Parent = page
+			corner(row, 6)
+			if not noHover then
+				row.MouseEnter:Connect(function()
+					tween(row, { BackgroundColor3 = theme.Element:Lerp(Color3.new(1, 1, 1), 0.07) }, 0.12)
+				end)
+				row.MouseLeave:Connect(function()
+					tween(row, { BackgroundColor3 = theme.Element }, 0.15)
+				end)
+			end
+			return row
+		end
+
+		function tab:CreateSection(name)
+			local l = makeLabel(page, name, nil, "SubText")
+			l.Size = UDim2.new(1, 0, 0, 18)
+			l.Font = Enum.Font.GothamBold
+			l.TextSize = 12
+		end
+
+		function tab:CreateLabel(text)
+			local row = makeRow(28, true)
+			local l = makeLabel(row, text, nil, "SubText")
+			l.Position = UDim2.fromOffset(10, 0)
+			l.Size = UDim2.new(1, -20, 1, 0)
+		end
+
+		function tab:CreateParagraph(o)
+			local row = makeRow(78, true)
+			local t = makeLabel(row, o.Title, nil, "Text")
+			t.Position = UDim2.fromOffset(14, 10)
+			t.Size = UDim2.new(1, -28, 0, 26)
+			t.Font = Enum.Font.GothamBold
+			t.TextSize = 20
+			if o.Animated then
+				t.TextColor3 = Color3.new(1, 1, 1)
+				-- unbind the themed color so the gradient controls the look
+				for i = #bindings, 1, -1 do
+					if bindings[i].obj == t then table.remove(bindings, i) end
+				end
+				local g = addGradient(t)
+				g.Offset = Vector2.new(-1, 0)
+				TweenService:Create(g,
+					TweenInfo.new(2.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+					{ Offset = Vector2.new(1, 0) }):Play()
+			end
+			local c = makeLabel(row, o.Content or "", nil, "SubText")
+			c.Position = UDim2.fromOffset(14, 40)
+			c.Size = UDim2.new(1, -28, 0, 30)
+			c.TextWrapped = true
+			c.TextYAlignment = Enum.TextYAlignment.Top
+		end
+
+		function tab:CreateButton(o)
+			local row = makeRow(32)
+			local l = makeLabel(row, o.Name, Enum.TextXAlignment.Center)
+			l.Size = UDim2.fromScale(1, 1)
+			row.MouseButton1Click:Connect(function()
+				row.BackgroundColor3 = theme.Accent
+				tween(row, { BackgroundColor3 = theme.Element }, 0.35)
+				if o.Callback then task.spawn(o.Callback) end
+			end)
+		end
+
+		function tab:CreateToggle(o)
+			local flag = o.Flag or o.Name
+			local value = false
+			local row = makeRow(32)
+			local l = makeLabel(row, o.Name)
+			l.Position = UDim2.fromOffset(10, 0)
+			l.Size = UDim2.new(1, -60, 1, 0)
+
+			local track = Instance.new("Frame")
+			track.Size = UDim2.fromOffset(36, 18)
+			track.Position = UDim2.new(1, -46, 0.5, -9)
+			track.BorderSizePixel = 0
+			bind(track, "BackgroundColor3", function(t) return value and t.Accent or t.Background end)
+			track.Parent = row
+			corner(track, 9)
+			local knob = Instance.new("Frame")
+			knob.Size = UDim2.fromOffset(14, 14)
+			knob.Position = UDim2.fromOffset(2, 2)
+			knob.BackgroundColor3 = Color3.new(1, 1, 1)
+			knob.BorderSizePixel = 0
+			knob.Parent = track
+			corner(knob, 7)
+
+			local function set(v, silent)
+				value = v == true
+				tween(track, { BackgroundColor3 = value and theme.Accent or theme.Background })
+				tween(knob, { Position = UDim2.fromOffset(value and 20 or 2, 2) }, 0.25, Enum.EasingStyle.Back)
+				commit(flag, value, silent, o.Callback)
+			end
+			row.MouseButton1Click:Connect(function() set(not value) end)
+			window.Setters[flag] = set
+			set(o.Default == true, true)
+			return { Set = function(_, v) set(v) end }
+		end
+
+		function tab:CreateSlider(o)
+			local flag = o.Flag or o.Name
+			local min, max, inc = o.Min or 0, o.Max or 100, o.Increment or 1
+			local row = makeRow(46, true)
+
+			local l = makeLabel(row, o.Name)
+			l.Position = UDim2.fromOffset(10, 4)
+			l.Size = UDim2.new(0.6, 0, 0, 16)
+			local valueLabel = makeLabel(row, "", Enum.TextXAlignment.Right, "SubText")
+			valueLabel.Position = UDim2.new(0.6, 0, 0, 4)
+			valueLabel.Size = UDim2.new(0.4, -10, 0, 16)
+
+			local hit = Instance.new("Frame")
+			hit.BackgroundTransparency = 1
+			hit.Position = UDim2.fromOffset(10, 26)
+			hit.Size = UDim2.new(1, -20, 0, 14)
+			hit.Parent = row
+			local track = Instance.new("Frame")
+			track.AnchorPoint = Vector2.new(0, 0.5)
+			track.Position = UDim2.fromScale(0, 0.5)
+			track.Size = UDim2.new(1, 0, 0, 6)
+			track.BorderSizePixel = 0
+			bind(track, "BackgroundColor3", "Background")
+			track.Parent = hit
+			corner(track, 3)
+			local fill = Instance.new("Frame")
+			fill.BorderSizePixel = 0
+			bind(fill, "BackgroundColor3", "Accent")
+			fill.Parent = track
+			corner(fill, 3)
+
+			local function set(v, silent)
+				v = math.clamp(tonumber(v) or min, min, max)
+				v = min + math.floor((v - min) / inc + 0.5) * inc
+				v = tonumber(string.format("%.3f", math.clamp(v, min, max)))
+				valueLabel.Text = tostring(v)
+				tween(fill, { Size = UDim2.fromScale((v - min) / (max - min), 1) }, 0.08)
+				commit(flag, v, silent, o.Callback)
+			end
+
+			local sliding = false
+			local function fromX(x)
+				local alpha = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+				set(min + alpha * (max - min))
+			end
+			hit.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch then
+					sliding = true
+					fromX(input.Position.X)
+				end
+			end)
+			UserInputService.InputChanged:Connect(function(input)
+				if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement
+					or input.UserInputType == Enum.UserInputType.Touch) then
+					fromX(input.Position.X)
+				end
+			end)
+			UserInputService.InputEnded:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch then
+					sliding = false
+				end
+			end)
+
+			window.Setters[flag] = set
+			set(o.Default or min, true)
+			return { Set = function(_, v) set(v) end }
+		end
+
+		-- Click-to-cycle dropdown
+		function tab:CreateDropdown(o)
+			local flag = o.Flag or o.Name
+			local options = o.Options
+			local value = options[1]
+			local row = makeRow(32)
+			local l = makeLabel(row, o.Name)
+			l.Position = UDim2.fromOffset(10, 0)
+			l.Size = UDim2.new(0.5, 0, 1, 0)
+			local valueLabel = makeLabel(row, "", Enum.TextXAlignment.Right, "Accent")
+			valueLabel.Position = UDim2.new(0.5, 0, 0, 0)
+			valueLabel.Size = UDim2.new(0.5, -10, 1, 0)
+
+			local function set(v, silent)
+				if not table.find(options, v) then return end
+				value = v
+				valueLabel.Text = v
+				commit(flag, v, silent, o.Callback)
+			end
+			row.MouseButton1Click:Connect(function()
+				set(options[(table.find(options, value) % #options) + 1])
+			end)
+			window.Setters[flag] = set
+			set(o.Default or options[1], true)
+			return { Set = function(_, v) set(v) end }
+		end
+
+		-- One row per theme: name, color swatches, check mark on the active one
+		function tab:CreateThemePicker()
+			for _, name in ipairs(ThemeOrder) do
+				local t = Themes[name]
+				local row = makeRow(32)
+				local l = makeLabel(row, name)
+				l.Position = UDim2.fromOffset(10, 0)
+				l.Size = UDim2.new(1, -110, 1, 0)
+
+				local check = makeLabel(row, "✓", Enum.TextXAlignment.Center, "Accent")
+				check.Position = UDim2.new(1, -92, 0, 0)
+				check.Size = UDim2.fromOffset(20, 32)
+				check.Font = Enum.Font.GothamBold
+				bind(check, "TextTransparency", function() return window.ThemeName == name and 0 or 1 end)
+
+				for i, c in ipairs({ t.Accent, t.Accent2 }) do
+					local sw = Instance.new("Frame")
+					sw.Size = UDim2.fromOffset(16, 16)
+					sw.Position = UDim2.new(1, -62 + (i - 1) * 22, 0.5, -8)
+					sw.BackgroundColor3 = c
+					sw.BorderSizePixel = 0
+					sw.Parent = row
+					corner(sw, 8)
+				end
+
+				row.MouseButton1Click:Connect(function() window:SetTheme(name) end)
+			end
+		end
+
+		return tab
+	end
+
+	return window
+end
+
+---------------------------------------------------------------------
+-- Menu definition
+---------------------------------------------------------------------
+local Window = UI:CreateWindow({
+	Name = "ESP Hub",
+	Theme = "Purple",
+	ConfigurationSaving = { Enabled = true, FolderName = "ESPHub" },
+})
+
+local Visuals = Window:CreateTab({ Name = "Visuals" })
+Visuals:CreateSection("Drawing")
+Visuals:CreateToggle({ Name = "ESP", Flag = "ESP", Default = true })
+Visuals:CreateToggle({ Name = "Boxes", Flag = "Boxes", Default = true })
+Visuals:CreateToggle({ Name = "Tracers", Flag = "Tracers", Default = true })
+Visuals:CreateToggle({ Name = "Skeleton", Flag = "Skeleton", Default = true })
+Visuals:CreateToggle({ Name = "Chams (highlight)", Flag = "Chams", Default = false })
+Visuals:CreateSection("Info")
+Visuals:CreateToggle({ Name = "Name tags", Flag = "Names", Default = true })
+Visuals:CreateToggle({ Name = "Distance", Flag = "Distance", Default = true })
+Visuals:CreateToggle({ Name = "Health bar", Flag = "HealthBar", Default = true })
+
+local Filters = Window:CreateTab({ Name = "Filters" })
+Filters:CreateDropdown({ Name = "Show", Flag = "Show", Options = { "All players", "Teammates", "Enemies" } })
+Filters:CreateDropdown({ Name = "Color", Flag = "ColorMode",
+	Options = { "Purple", "Red", "Green", "Blue", "Yellow", "Team color" } })
+Filters:CreateDropdown({ Name = "Tracer origin", Flag = "TracerOrigin",
+	Options = { "Bottom", "Center", "Top", "Mouse" } })
+Filters:CreateDropdown({ Name = "Max range", Flag = "MaxRange",
+	Options = { "250", "500", "1000", "2000", "Unlimited" }, Default = "2000" })
+
+local Style = Window:CreateTab({ Name = "Style" })
+Style:CreateSlider({ Name = "Line thickness", Flag = "LineThickness", Min = 1, Max = 4, Increment = 0.5, Default = 1.5 })
+Style:CreateSlider({ Name = "Chams transparency", Flag = "ChamsTransparency", Min = 0, Max = 1, Increment = 0.05, Default = 0.6 })
+
+local Aim = Window:CreateTab({ Name = "Aim" })
+Aim:CreateSection("Aim assist (hold right mouse)")
+Aim:CreateToggle({ Name = "Enabled", Flag = "Aim", Default = false })
+Aim:CreateToggle({ Name = "Show FOV circle", Flag = "AimFOVShow", Default = true })
+Aim:CreateToggle({ Name = "Team check", Flag = "AimTeamCheck", Default = true })
+Aim:CreateToggle({ Name = "Wall check", Flag = "AimWallCheck", Default = true })
+Aim:CreateDropdown({ Name = "Target", Flag = "AimPart", Options = { "Head", "Torso" } })
+Aim:CreateSlider({ Name = "FOV radius", Flag = "AimFOV", Min = 30, Max = 400, Increment = 5, Default = 120 })
+Aim:CreateSlider({ Name = "Smoothness", Flag = "AimSmooth", Min = 0.05, Max = 1, Increment = 0.05, Default = 0.25 })
+
+local ThemesTab = Window:CreateTab({ Name = "Themes" })
+ThemesTab:CreateSection("Pick a theme")
+ThemesTab:CreateThemePicker()
+
+local SettingsTab = Window:CreateTab({ Name = "Settings" })
+SettingsTab:CreateButton({ Name = "Save config", Callback = function() Window:SaveConfig() end })
+SettingsTab:CreateButton({ Name = "Load config", Callback = function() Window:LoadConfig() end })
+SettingsTab:CreateToggle({
+	Name = "Animated background",
+	Flag = "AnimBG",
+	Default = true,
+	Callback = function(v) Window:SetBackground(v) end,
+})
+SettingsTab:CreateLabel("Menu key: RightShift")
+
+local Credits = Window:CreateTab({ Name = "Credits" })
+Credits:CreateParagraph({
+	Title = "Made by crona & jonh",
+	Content = "ESP Hub: script and UI design by crona and jonh.",
+	Animated = true,
+})
+
+local F = Window.Flags
+
+---------------------------------------------------------------------
+-- ESP
+---------------------------------------------------------------------
+local colorMap = {
+	Purple = Color3.fromRGB(170, 100, 255),
+	Red = Color3.fromRGB(255, 60, 60),
+	Green = Color3.fromRGB(60, 255, 100),
+	Blue = Color3.fromRGB(60, 160, 255),
+	Yellow = Color3.fromRGB(255, 220, 60),
+}
+local rangeMap = { ["250"] = 250, ["500"] = 500, ["1000"] = 1000, ["2000"] = 2000, Unlimited = math.huge }
+
+local overlay = Instance.new("ScreenGui")
+overlay.Name = "ESPOverlay"
+overlay.ResetOnSpawn = false
+overlay.IgnoreGuiInset = true
+overlay.DisplayOrder = 5
+overlay.Parent = playerGui
+
+local objects = {}
+
+local function newFrame(parent)
+	local f = Instance.new("Frame")
+	f.BorderSizePixel = 0
+	f.Visible = false
+	f.Parent = parent
+	return f
+end
+
+local MAX_BONES = 20
+
+local function createObjects(player)
+	if player == localPlayer or objects[player] then return end
+	local obj = {}
+
+	obj.box = newFrame(overlay)
+	obj.box.BackgroundTransparency = 1
+	obj.stroke = Instance.new("UIStroke")
+	obj.stroke.Parent = obj.box
+
+	obj.tracer = newFrame(overlay)
+	obj.tracer.AnchorPoint = Vector2.new(0.5, 0.5)
+
+	obj.bones = {}
+	for i = 1, MAX_BONES do
+		local line = newFrame(overlay)
+		line.AnchorPoint = Vector2.new(0.5, 0.5)
+		obj.bones[i] = line
+	end
+
+	obj.hpBg = newFrame(overlay)
+	obj.hpBg.BackgroundColor3 = Color3.new(0, 0, 0)
+	obj.hpBg.BackgroundTransparency = 0.4
+	obj.hpFill = Instance.new("Frame")
+	obj.hpFill.BorderSizePixel = 0
+	obj.hpFill.AnchorPoint = Vector2.new(0, 1)
+	obj.hpFill.Position = UDim2.fromScale(0, 1)
+	obj.hpFill.Size = UDim2.fromScale(1, 1)
+	obj.hpFill.Parent = obj.hpBg
+
+	obj.label = Instance.new("TextLabel")
+	obj.label.BackgroundTransparency = 1
+	obj.label.AnchorPoint = Vector2.new(0.5, 1)
+	obj.label.Size = UDim2.fromOffset(240, 16)
+	obj.label.Font = Enum.Font.GothamBold
+	obj.label.TextSize = 13
+	obj.label.TextStrokeTransparency = 0.4
+	obj.label.Visible = false
+	obj.label.Parent = overlay
+
+	objects[player] = obj
+end
+
+local function destroyObjects(player)
+	local obj = objects[player]
+	if not obj then return end
+	obj.box:Destroy()
+	obj.tracer:Destroy()
+	obj.hpBg:Destroy()
+	obj.label:Destroy()
+	for _, line in ipairs(obj.bones) do line:Destroy() end
+	objects[player] = nil
+end
+
+local function hide2D(obj)
+	obj.box.Visible = false
+	obj.tracer.Visible = false
+	obj.hpBg.Visible = false
+	obj.label.Visible = false
+	for _, line in ipairs(obj.bones) do line.Visible = false end
+end
+
+local function setLine(frame, a, b, thickness, color)
+	local delta = b - a
+	frame.Size = UDim2.fromOffset(delta.Magnitude, thickness)
+	frame.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
+	frame.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+	frame.BackgroundColor3 = color
+	frame.Visible = true
+end
+
+local function getColor(player)
+	if F.ColorMode == "Team color" then return player.TeamColor.Color end
+	return colorMap[F.ColorMode] or Color3.new(1, 1, 1)
+end
+
+-- Note: this uses Roblox's Team service. If your game tracks sides another way
+-- (e.g. an attribute), change this function and the team check in the aim section.
+-- If there are no teams, everyone counts as a "teammate".
+local function passesFilter(player)
+	if F.Show == "All players" then return true end
+	local sameTeam = player.Team == localPlayer.Team
+	if F.Show == "Teammates" then return sameTeam end
+	return not sameTeam
+end
+
+local function getOrigin(viewport)
+	local mode = F.TracerOrigin
+	if mode == "Center" then return viewport / 2 end
+	if mode == "Top" then return Vector2.new(viewport.X / 2, 0) end
+	if mode == "Mouse" then return UserInputService:GetMouseLocation() end
+	return Vector2.new(viewport.X / 2, viewport.Y)
+end
+
+local function setHighlight(character, on, color)
+	local hl = character:FindFirstChild("ESPHighlight")
+	if on then
+		if not hl then
+			hl = Instance.new("Highlight")
+			hl.Name = "ESPHighlight"
+			hl.OutlineColor = Color3.new(1, 1, 1)
+			hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			hl.Parent = character
+		end
+		hl.FillColor = color
+		hl.FillTransparency = F.ChamsTransparency
+	elseif hl then
+		hl:Destroy()
+	end
+end
+
+RunService.RenderStepped:Connect(function()
+	local camera = workspace.CurrentCamera
+	if not camera then return end
+	local viewport = camera.ViewportSize
+	local maxDistance = rangeMap[F.MaxRange] or math.huge
+	local origin = getOrigin(viewport)
+	local thickness = F.LineThickness
+
+	for player, obj in pairs(objects) do
+		local info = getInfo(player)
+		local character = info and info.character
+		local root = info and info.root
+
+		local valid = F.ESP and info ~= nil and info.health > 0 and passesFilter(player)
+		local distance = 0
+		if valid then
+			distance = (camera.CFrame.Position - root.Position).Magnitude
+			if distance > maxDistance then valid = false end
+		end
+
+		if character then
+			setHighlight(character, valid and F.Chams, valid and getColor(player) or Color3.new())
+		end
+
+		if not valid then
+			hide2D(obj)
+			continue
+		end
+
+		local color = getColor(player)
+
+		-- Box fitted to the whole model, so it works with any character shape
+		local boxCF, boxSize = character:GetBoundingBox()
+		local top = camera:WorldToViewportPoint(boxCF.Position + Vector3.new(0, boxSize.Y / 2, 0))
+		local bottom = camera:WorldToViewportPoint(boxCF.Position - Vector3.new(0, boxSize.Y / 2, 0))
+		if top.Z <= 0 or bottom.Z <= 0 then
+			hide2D(obj)
+			continue
+		end
+
+		local height = math.abs(bottom.Y - top.Y)
+		local width = height * 0.55
+		local cx = top.X
+		local x = cx - width / 2
+		local y = top.Y
+
+		obj.box.Visible = F.Boxes
+		if F.Boxes then
+			obj.box.Position = UDim2.fromOffset(x, y)
+			obj.box.Size = UDim2.fromOffset(width, height)
+			obj.stroke.Color = color
+			obj.stroke.Thickness = thickness
+		end
+
+		local parts = {}
+		if F.Names then table.insert(parts, player.DisplayName) end
+		if F.Distance then table.insert(parts, "[" .. math.floor(distance) .. "]") end
+		if #parts > 0 then
+			obj.label.Text = table.concat(parts, " ")
+			obj.label.TextColor3 = color
+			obj.label.Position = UDim2.fromOffset(cx, y - 2)
+			obj.label.Visible = true
+		else
+			obj.label.Visible = false
+		end
+
+		obj.hpBg.Visible = F.HealthBar
+		if F.HealthBar then
+			local pct = math.clamp(info.health / math.max(info.maxHealth, 1), 0, 1)
+			obj.hpBg.Position = UDim2.fromOffset(x - 6, y)
+			obj.hpBg.Size = UDim2.fromOffset(3, height)
+			obj.hpFill.Size = UDim2.fromScale(1, pct)
+			obj.hpFill.BackgroundColor3 = Color3.fromHSV(pct * 0.33, 1, 1)
+		end
+
+		if F.Tracers then
+			setLine(obj.tracer, origin, Vector2.new(cx, y + height), thickness, color)
+		else
+			obj.tracer.Visible = false
+		end
+
+		for i, line in ipairs(obj.bones) do
+			local pair = CUSTOM_BONES[i]
+			local partA = pair and F.Skeleton and character:FindFirstChild(pair[1], true)
+			local partB = pair and F.Skeleton and character:FindFirstChild(pair[2], true)
+			if partA and partB and partA:IsA("BasePart") and partB:IsA("BasePart") then
+				local a = camera:WorldToViewportPoint(partA.Position)
+				local b = camera:WorldToViewportPoint(partB.Position)
+				if a.Z > 0 and b.Z > 0 then
+					setLine(line, Vector2.new(a.X, a.Y), Vector2.new(b.X, b.Y), thickness, color)
+				else
+					line.Visible = false
+				end
+			else
+				line.Visible = false
+			end
+		end
+	end
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do createObjects(player) end
+Players.PlayerAdded:Connect(createObjects)
+Players.PlayerRemoving:Connect(destroyObjects)
+
+---------------------------------------------------------------------
+-- Aim assist
+---------------------------------------------------------------------
+local fovCircle = Instance.new("Frame")
+fovCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+fovCircle.BackgroundTransparency = 1
+fovCircle.BorderSizePixel = 0
+fovCircle.Visible = false
+fovCircle.Parent = overlay
+do
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0.5, 0)
+	c.Parent = fovCircle
+	local s = Instance.new("UIStroke")
+	s.Thickness = 1.5
+	s.Color = Color3.fromRGB(170, 100, 255)
+	s.Parent = fovCircle
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function getAimPart(character, root)
+	if F.AimPart == "Head" then
+		return character:FindFirstChild(CFG.HeadName, true) or root
+	end
+	return (CFG.TorsoName and character:FindFirstChild(CFG.TorsoName, true)) or root
+end
+
+local function isVisible(camera, part, character)
+	rayParams.FilterDescendantsInstances = { localPlayer.Character, character }
+	local origin = camera.CFrame.Position
+	return workspace:Raycast(origin, part.Position - origin, rayParams) == nil
+end
+
+local function getTarget(camera, mousePos)
+	local best, bestDist = nil, F.AimFOV
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player == localPlayer then continue end
+		if F.AimTeamCheck and localPlayer.Team ~= nil and player.Team == localPlayer.Team then continue end
+
+		local info = getInfo(player)
+		if not info or info.health <= 0 then continue end
+		local character = info.character
+		local part = getAimPart(character, info.root)
+		if not part or not part:IsA("BasePart") then continue end
+
+		local pos, onScreen = camera:WorldToViewportPoint(part.Position)
+		if not onScreen then continue end
+
+		local dist = (Vector2.new(pos.X, pos.Y) - mousePos).Magnitude
+		if dist < bestDist and (not F.AimWallCheck or isVisible(camera, part, character)) then
+			best, bestDist = part, dist
+		end
+	end
+	return best
+end
+
+RunService:BindToRenderStep("AimAssist", Enum.RenderPriority.Camera.Value + 1, function()
+	local camera = workspace.CurrentCamera
+	if not camera then return end
+
+	local mousePos = UserInputService:GetMouseLocation()
+
+	fovCircle.Visible = F.Aim and F.AimFOVShow
+	if fovCircle.Visible then
+		fovCircle.Position = UDim2.fromOffset(mousePos.X, mousePos.Y)
+		fovCircle.Size = UDim2.fromOffset(F.AimFOV * 2, F.AimFOV * 2)
+	end
+
+	if not F.Aim or not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then return end
+
+	local target = getTarget(camera, mousePos)
+	if target then
+		local goal = CFrame.lookAt(camera.CFrame.Position, target.Position)
+		camera.CFrame = camera.CFrame:Lerp(goal, F.AimSmooth)
+	end
+end)
+
+Window:LoadConfig()
